@@ -1,0 +1,238 @@
+name: CI/CD Pipeline — Build, Test, Push & Deploy
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_target:
+        description: "Deployment target (aws | azure | both)"
+        required: true
+        default: "aws"
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/fastapi-cloud-devops
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  # ── Job 1: Lint & Unit Tests ──────────────────────────────────────────────
+  test:
+    name: 🧪 Lint & Unit Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 pytest-cov
+
+      - name: Lint with flake8
+        run: |
+          flake8 app/ tests/ \
+            --max-line-length=120 \
+            --ignore=E501,W503 \
+            --exclude=__pycache__
+
+      - name: Run unit tests with coverage
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            --tb=short \
+            -v
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          retention-days: 7
+
+  # ── Job 2: Docker Build & Security Scan ──────────────────────────────────
+  docker-build:
+    name: 🐳 Build & Scan Docker Image
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+      image-tag: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build Docker image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
+
+      - name: Scan image with Trivy (vulnerability scan)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          format: sarif
+          output: trivy-results.sarif
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"   # don't fail pipeline; upload results for review
+
+      - name: Upload Trivy scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+
+  # ── Job 3: Deploy to AWS EKS ──────────────────────────────────────────────
+  deploy-aws:
+    name: ☁️ Deploy to AWS EKS
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: |
+      github.ref == 'refs/heads/main' &&
+      (github.event.inputs.deploy_target == 'aws' || github.event.inputs.deploy_target == 'both' || github.event_name == 'push')
+    environment: production-aws
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Update kubeconfig for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ secrets.AWS_REGION }} \
+            --name ${{ secrets.EKS_CLUSTER_NAME }}
+
+      - name: Set image tag in Kubernetes manifests
+        run: |
+          IMAGE_TAG="sha-${{ github.sha }}"
+          sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}|g" \
+            kubernetes/deployment.yaml
+
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f kubernetes/namespace.yaml
+          kubectl apply -f kubernetes/configmap.yaml
+          kubectl apply -f kubernetes/secret.yaml
+          kubectl apply -f kubernetes/deployment.yaml
+          kubectl apply -f kubernetes/service.yaml
+          kubectl apply -f kubernetes/ingress.yaml
+          kubectl apply -f kubernetes/hpa.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/fastapi-cloud-devops \
+            -n cloud-devops \
+            --timeout=300s
+
+      - name: Verify deployment health
+        run: |
+          kubectl get pods -n cloud-devops
+          kubectl get services -n cloud-devops
+
+  # ── Job 4: Deploy to Azure AKS ────────────────────────────────────────────
+  deploy-azure:
+    name: 🌐 Deploy to Azure AKS
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: |
+      github.ref == 'refs/heads/main' &&
+      (github.event.inputs.deploy_target == 'azure' || github.event.inputs.deploy_target == 'both')
+    environment: production-azure
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Set AKS context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ secrets.AZURE_RESOURCE_GROUP }}
+          cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+      - name: Set image tag in Kubernetes manifests
+        run: |
+          IMAGE_TAG="sha-${{ github.sha }}"
+          sed -i "s|IMAGE_TAG_PLACEHOLDER|${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG}|g" \
+            kubernetes/deployment.yaml
+
+      - name: Apply Kubernetes manifests
+        run: |
+          kubectl apply -f kubernetes/namespace.yaml
+          kubectl apply -f kubernetes/configmap.yaml
+          kubectl apply -f kubernetes/secret.yaml
+          kubectl apply -f kubernetes/deployment.yaml
+          kubectl apply -f kubernetes/service.yaml
+          kubectl apply -f kubernetes/ingress.yaml
+          kubectl apply -f kubernetes/hpa.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/fastapi-cloud-devops \
+            -n cloud-devops \
+            --timeout=300s
+
+      - name: Verify deployment health
+        run: |
+          kubectl get pods -n cloud-devops
+          kubectl get services -n cloud-devops

@@ -1,0 +1,14 @@
+apiVersion: v2
+name: fastapi-app
+description: Helm chart for the Cloud DevOps Multi-Cloud FastAPI microservice
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - fastapi
+  - python
+  - cloud-devops
+  - microservice
+maintainers:
+  - name: Parnika Goud Bingi
+    email: bingiparnikagoud24@gmail.com

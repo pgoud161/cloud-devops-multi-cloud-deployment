@@ -1,0 +1,49 @@
+name: PR Validation
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  validate:
+    name: 🔍 Validate PR
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt flake8 pytest-cov
+
+      - name: Lint
+        run: flake8 app/ tests/ --max-line-length=120 --ignore=E501,W503
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short
+
+      - name: Validate Kubernetes manifests
+        uses: azure/k8s-lint@v1
+        with:
+          manifests: |
+            kubernetes/deployment.yaml
+            kubernetes/service.yaml
+            kubernetes/ingress.yaml
+
+      - name: Validate Terraform (AWS)
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.8.0
+
+      - name: Terraform fmt check (AWS)
+        working-directory: terraform/aws
+        run: terraform fmt -check -recursive
+
+      - name: Terraform fmt check (Azure)
+        working-directory: terraform/azure
+        run: terraform fmt -check -recursive
